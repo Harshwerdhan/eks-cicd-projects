@@ -1,0 +1,37 @@
+---
+# Shared active service — selector points to whichever slot is live
+apiVersion: v1
+kind: Service
+metadata:
+  name: nodeapp-active
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: nodeapp
+spec:
+  selector:
+    app: nodeapp
+    slot: {{ .Values.activeSlot }}
+  type: LoadBalancer
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+      protocol: TCP
+---
+# Per-slot service for smoke testing the standby
+apiVersion: v1
+kind: Service
+metadata:
+  name: nodeapp-{{ .Values.slot }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: nodeapp
+    slot: {{ .Values.slot }}
+spec:
+  selector:
+    app: nodeapp
+    slot: {{ .Values.slot }}
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+      protocol: TCP

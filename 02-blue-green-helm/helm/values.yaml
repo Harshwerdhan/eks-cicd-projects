@@ -1,0 +1,28 @@
+# Deployment slot: blue | green
+# Each release overrides this value
+slot: blue
+
+# The shared Service points to pods with this slot label
+# Change this to switch live traffic
+activeSlot: blue
+
+replicaCount: 2
+
+image:
+  repository: ""
+  tag: latest
+  pullPolicy: Always
+
+service:
+  port: 80
+  targetPort: 3000
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "256Mi"
+
+namespace: production

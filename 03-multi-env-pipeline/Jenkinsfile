@@ -1,0 +1,179 @@
+pipeline {
+  agent any
+
+  parameters {
+    choice(
+      name: 'TARGET_ENV',
+      choices: ['dev', 'staging', 'prod'],
+      description: 'Environment to deploy to'
+    )
+    string(
+      name: 'IMAGE_TAG',
+      defaultValue: '',
+      description: 'Image tag override (leave blank to use BUILD_NUMBER)'
+    )
+  }
+
+  environment {
+    AWS_REGION   = "us-east-1"
+    ECR_REGISTRY = credentials('ecr-registry-url')
+    TAG          = "${params.IMAGE_TAG ?: env.BUILD_NUMBER}"
+    SERVICES     = "api-gateway user-service order-service"
+    REGION       = "us-east-1"
+  }
+
+  options {
+    timeout(time: 60, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+  }
+
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('Test All Services') {
+      parallel {
+        stage('Test api-gateway') {
+          steps {
+            dir('services/api-gateway') {
+              sh 'npm ci && npm test'
+            }
+          }
+        }
+        stage('Test user-service') {
+          steps {
+            dir('services/user-service') {
+              sh '''
+                python3 -m venv venv
+                . venv/bin/activate
+                pip install -q -r requirements.txt
+                pytest -v
+              '''
+            }
+          }
+        }
+        stage('Test order-service') {
+          steps {
+            dir('services/order-service') {
+              sh 'npm ci && npm test'
+            }
+          }
+        }
+      }
+    }
+
+    stage('Build & Push All Images') {
+      steps {
+        sh '''
+          aws ecr get-login-password --region ${AWS_REGION} \
+            | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+        '''
+        script {
+          env.SERVICES.split().each { svc ->
+            sh """
+              docker build \
+                -t ${ECR_REGISTRY}/microservices-${svc}:${TAG} \
+                -t ${ECR_REGISTRY}/microservices-${svc}:latest \
+                services/${svc}/
+              docker push ${ECR_REGISTRY}/microservices-${svc}:${TAG}
+              docker push ${ECR_REGISTRY}/microservices-${svc}:latest
+            """
+          }
+        }
+      }
+    }
+
+    stage('Deploy to Dev') {
+      when {
+        anyOf {
+          branch 'develop'
+          expression { params.TARGET_ENV == 'dev' }
+        }
+      }
+      steps { script { deployToEnv('dev') } }
+    }
+
+    stage('Integration Tests') {
+      when { branch 'main' }
+      steps {
+        sh '''
+          LB=$(kubectl get svc api-gateway -n dev \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          curl -sf http://${LB}/health
+          echo "Integration tests passed on dev"
+        '''
+      }
+    }
+
+    stage('Deploy to Staging') {
+      when {
+        anyOf {
+          branch 'main'
+          expression { params.TARGET_ENV == 'staging' }
+        }
+      }
+      steps { script { deployToEnv('staging') } }
+    }
+
+    stage('Approval: Production') {
+      when {
+        anyOf {
+          expression { params.TARGET_ENV == 'prod' }
+        }
+      }
+      steps {
+        input(
+          message: "Deploy build ${TAG} to PRODUCTION?",
+          ok: "Promote to Prod",
+          submitter: "devops-leads"
+        )
+      }
+    }
+
+    stage('Deploy to Production') {
+      when {
+        expression { params.TARGET_ENV == 'prod' }
+      }
+      steps { script { deployToEnv('prod') } }
+    }
+  }
+
+  post {
+    success {
+      echo "Deployed build ${TAG} to ${params.TARGET_ENV} successfully"
+    }
+    failure {
+      echo "Pipeline failed for build ${TAG}"
+    }
+    always {
+      sh 'docker image prune -f || true'
+      cleanWs()
+    }
+  }
+}
+
+def deployToEnv(String env) {
+  sh """
+    aws eks update-kubeconfig \
+      --region ${AWS_REGION} \
+      --name microservices-${env}
+
+    kubectl create namespace ${env} --dry-run=client -o yaml | kubectl apply -f -
+
+    # Substitute image placeholders
+    sed -i "s|API_GATEWAY_IMAGE|${ECR_REGISTRY}/microservices-api-gateway:${TAG}|g" \
+      k8s/base/api-gateway-deployment.yaml
+    sed -i "s|USER_SERVICE_IMAGE|${ECR_REGISTRY}/microservices-user-service:${TAG}|g" \
+      k8s/base/user-service-deployment.yaml
+    sed -i "s|ORDER_SERVICE_IMAGE|${ECR_REGISTRY}/microservices-order-service:${TAG}|g" \
+      k8s/base/order-service-deployment.yaml
+
+    kubectl apply -k k8s/overlays/${env}/
+
+    kubectl rollout status deployment/api-gateway   -n ${env} --timeout=180s
+    kubectl rollout status deployment/user-service  -n ${env} --timeout=180s
+    kubectl rollout status deployment/order-service -n ${env} --timeout=180s
+  """
+}

@@ -1,0 +1,129 @@
+pipeline {
+  agent any
+
+  environment {
+    AWS_REGION      = "us-east-1"
+    ECR_REGISTRY    = credentials('ecr-registry-url')
+    TAG             = "${env.BUILD_NUMBER}"
+    CLUSTER         = "fullstack-cluster"
+    NAMESPACE       = "production"
+    REACT_APP_API_URL = "/api"
+  }
+
+  options {
+    timeout(time: 45, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+  }
+
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('Test') {
+      parallel {
+        stage('Frontend Tests') {
+          steps {
+            dir('frontend') {
+              sh 'npm ci && npm test'
+            }
+          }
+        }
+        stage('Backend Tests') {
+          steps {
+            dir('backend') {
+              sh 'npm ci && npm test'
+            }
+          }
+        }
+      }
+    }
+
+    stage('Build & Push Images') {
+      steps {
+        sh '''
+          aws ecr get-login-password --region ${AWS_REGION} \
+            | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+        '''
+        parallel(
+          'Build Frontend': {
+            sh """
+              docker build \
+                --build-arg REACT_APP_API_URL=${REACT_APP_API_URL} \
+                -t ${ECR_REGISTRY}/fullstack-frontend:${TAG} \
+                -t ${ECR_REGISTRY}/fullstack-frontend:latest \
+                frontend/
+              docker push ${ECR_REGISTRY}/fullstack-frontend:${TAG}
+              docker push ${ECR_REGISTRY}/fullstack-frontend:latest
+            """
+          },
+          'Build Backend': {
+            sh """
+              docker build \
+                -t ${ECR_REGISTRY}/fullstack-backend:${TAG} \
+                -t ${ECR_REGISTRY}/fullstack-backend:latest \
+                backend/
+              docker push ${ECR_REGISTRY}/fullstack-backend:${TAG}
+              docker push ${ECR_REGISTRY}/fullstack-backend:latest
+            """
+          }
+        )
+      }
+    }
+
+    stage('Deploy') {
+      steps {
+        sh '''
+          aws eks update-kubeconfig \
+            --region ${AWS_REGION} \
+            --name ${CLUSTER}
+
+          kubectl create namespace ${NAMESPACE} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          helm upgrade --install fullstack ./helm/fullstack \
+            --namespace ${NAMESPACE} \
+            --set frontend.image.repository=${ECR_REGISTRY}/fullstack-frontend \
+            --set frontend.image.tag=${TAG} \
+            --set backend.image.repository=${ECR_REGISTRY}/fullstack-backend \
+            --set backend.image.tag=${TAG} \
+            --wait \
+            --timeout 5m
+        '''
+      }
+    }
+
+    stage('Smoke Test') {
+      steps {
+        sh '''
+          kubectl rollout status deployment/frontend -n ${NAMESPACE} --timeout=120s
+          kubectl rollout status deployment/backend  -n ${NAMESPACE} --timeout=120s
+
+          LB=$(kubectl get svc frontend-svc \
+            -n ${NAMESPACE} \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+          for i in $(seq 1 9); do
+            if curl --silent --fail --max-time 10 http://${LB}/health; then
+              echo "Frontend smoke test passed"
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+        '''
+      }
+    }
+  }
+
+  post {
+    failure {
+      sh 'helm rollback fullstack -n ${NAMESPACE} || true'
+    }
+    always {
+      sh 'docker image prune -f || true'
+      cleanWs()
+    }
+  }
+}

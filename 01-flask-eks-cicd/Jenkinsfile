@@ -1,0 +1,122 @@
+pipeline {
+  agent any
+
+  environment {
+    AWS_REGION     = "us-east-1"
+    ECR_REGISTRY   = credentials('ecr-registry-url')   // set in Jenkins credentials store
+    IMAGE_NAME     = "flask-eks-flask-app"
+    IMAGE_TAG      = "${env.BUILD_NUMBER}"
+    KUBE_NAMESPACE = "production"
+    CLUSTER_NAME   = "flask-eks-cluster"
+  }
+
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+    timeout(time: 30, unit: 'MINUTES')
+    disableConcurrentBuilds()
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+        echo "Branch: ${env.BRANCH_NAME}  |  Build: ${env.BUILD_NUMBER}"
+      }
+    }
+
+    stage('Test') {
+      steps {
+        dir('app') {
+          sh '''
+            python3 -m venv venv
+            . venv/bin/activate
+            pip install --quiet -r requirements.txt
+            pytest tests/ -v --tb=short --junitxml=../test-results.xml
+          '''
+        }
+      }
+      post {
+        always {
+          junit allowEmptyResults: true, testResults: 'test-results.xml'
+        }
+      }
+    }
+
+    stage('Build & Push Image') {
+      steps {
+        dir('app') {
+          sh '''
+            aws ecr get-login-password --region ${AWS_REGION} \
+              | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+            docker build \
+              --tag ${ECR_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} \
+              --tag ${ECR_REGISTRY}/${IMAGE_NAME}:latest \
+              --cache-from ${ECR_REGISTRY}/${IMAGE_NAME}:latest \
+              .
+
+            docker push ${ECR_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+            docker push ${ECR_REGISTRY}/${IMAGE_NAME}:latest
+          '''
+        }
+      }
+    }
+
+    stage('Deploy to EKS') {
+      steps {
+        sh '''
+          aws eks update-kubeconfig \
+            --region ${AWS_REGION} \
+            --name ${CLUSTER_NAME}
+
+          # Substitute image placeholder with real image URI
+          sed -i "s|IMAGE_PLACEHOLDER|${ECR_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}|g" \
+            k8s/deployment.yaml
+
+          kubectl apply -f k8s/ -n ${KUBE_NAMESPACE}
+
+          kubectl rollout status deployment/flask-app \
+            -n ${KUBE_NAMESPACE} \
+            --timeout=180s
+        '''
+      }
+    }
+
+    stage('Smoke Test') {
+      steps {
+        sh '''
+          LB=$(kubectl get svc flask-app-svc \
+            -n ${KUBE_NAMESPACE} \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+          echo "Load balancer: ${LB}"
+
+          # Retry for up to 90s while LB provisions
+          for i in $(seq 1 9); do
+            if curl --silent --fail --max-time 10 http://${LB}/health; then
+              echo "Smoke test passed"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "Smoke test failed"
+          exit 1
+        '''
+      }
+    }
+  }
+
+  post {
+    failure {
+      sh '''
+        echo "Deployment failed — rolling back"
+        kubectl rollout undo deployment/flask-app -n ${KUBE_NAMESPACE} || true
+      '''
+    }
+    always {
+      sh 'docker image prune -f || true'
+      cleanWs()
+    }
+  }
+}

@@ -1,0 +1,159 @@
+pipeline {
+  agent any
+
+  environment {
+    AWS_REGION   = "us-east-1"
+    ECR_REGISTRY = credentials('ecr-registry-url')
+    IMAGE_TAG    = "${env.BUILD_NUMBER}"
+    CLUSTER      = "blue-green-cluster"
+    NAMESPACE    = "production"
+  }
+
+  options {
+    timeout(time: 45, unit: 'MINUTES')
+    disableConcurrentBuilds()
+  }
+
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('Test') {
+      steps {
+        dir('app') {
+          sh 'npm ci && npm test'
+        }
+      }
+    }
+
+    stage('Build & Push') {
+      steps {
+        dir('app') {
+          sh '''
+            aws ecr get-login-password --region ${AWS_REGION} \
+              | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+            docker build \
+              -t ${ECR_REGISTRY}/blue-green-nodeapp:${IMAGE_TAG} \
+              -t ${ECR_REGISTRY}/blue-green-nodeapp:latest \
+              .
+
+            docker push ${ECR_REGISTRY}/blue-green-nodeapp:${IMAGE_TAG}
+            docker push ${ECR_REGISTRY}/blue-green-nodeapp:latest
+          '''
+        }
+      }
+    }
+
+    stage('Determine Slots') {
+      steps {
+        script {
+          sh "aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER}"
+
+          // Find which slot is currently active (default to blue on first deploy)
+          def activeSlot = sh(
+            script: """
+              kubectl get svc nodeapp-active -n ${NAMESPACE} \
+                -o jsonpath='{.spec.selector.slot}' 2>/dev/null || echo 'blue'
+            """,
+            returnStdout: true
+          ).trim()
+
+          env.ACTIVE_SLOT  = activeSlot
+          env.STANDBY_SLOT = (activeSlot == 'blue') ? 'green' : 'blue'
+
+          echo "Active: ${env.ACTIVE_SLOT}  |  Deploying to standby: ${env.STANDBY_SLOT}"
+        }
+      }
+    }
+
+    stage('Deploy to Standby') {
+      steps {
+        sh '''
+          helm upgrade --install nodeapp-${STANDBY_SLOT} ./charts/nodeapp \
+            --namespace ${NAMESPACE} \
+            --create-namespace \
+            --set slot=${STANDBY_SLOT} \
+            --set activeSlot=${ACTIVE_SLOT} \
+            --set image.repository=${ECR_REGISTRY}/blue-green-nodeapp \
+            --set image.tag=${IMAGE_TAG} \
+            --wait \
+            --timeout 3m
+        '''
+      }
+    }
+
+    stage('Smoke Test Standby') {
+      steps {
+        sh '''
+          # Wait for pods to be ready
+          kubectl wait --for=condition=ready pod \
+            -l app=nodeapp,slot=${STANDBY_SLOT} \
+            -n ${NAMESPACE} \
+            --timeout=120s
+
+          # Port-forward and test
+          kubectl port-forward \
+            svc/nodeapp-${STANDBY_SLOT} 8080:80 \
+            -n ${NAMESPACE} &
+          PF_PID=$!
+          sleep 5
+
+          RESULT=0
+          curl -sf http://localhost:8080/health || RESULT=1
+          curl -sf http://localhost:8080/       || RESULT=1
+
+          kill $PF_PID 2>/dev/null || true
+
+          if [ $RESULT -ne 0 ]; then
+            echo "Smoke test failed"
+            exit 1
+          fi
+          echo "Smoke test passed"
+        '''
+      }
+    }
+
+    stage('Switch Traffic') {
+      steps {
+        input message: "Switch live traffic from [${env.ACTIVE_SLOT}] to [${env.STANDBY_SLOT}]?",
+              ok: "Go Live"
+
+        sh '''
+          # Patch the shared service selector to the new slot
+          helm upgrade nodeapp-${STANDBY_SLOT} ./charts/nodeapp \
+            --namespace ${NAMESPACE} \
+            --reuse-values \
+            --set activeSlot=${STANDBY_SLOT}
+
+          echo "Traffic now routing to: ${STANDBY_SLOT}"
+        '''
+      }
+    }
+
+    stage('Scale Down Old Slot') {
+      steps {
+        sh '''
+          # Keep old slot at 1 replica as warm standby
+          kubectl scale deployment nodeapp-${ACTIVE_SLOT} \
+            --replicas=1 \
+            -n ${NAMESPACE} || true
+        '''
+      }
+    }
+  }
+
+  post {
+    failure {
+      sh '''
+        echo "Pipeline failed — traffic remains on ${ACTIVE_SLOT}"
+        helm rollback nodeapp-${STANDBY_SLOT} -n ${NAMESPACE} 2>/dev/null || true
+      '''
+    }
+    always {
+      sh 'docker image prune -f || true'
+      cleanWs()
+    }
+  }
+}
